@@ -86,7 +86,9 @@ nothing to update on the host: stop the server and relaunch it as
 ## If an update fails
 
 Keep the client open until it reconnects or reports a failure. A failed service
-update can roll back to the previous version. If the update still fails:
+update can roll back to the previous version, so a successful one keeps that
+version in `~/.t3/runtime/versions` and removes older ones that nothing still
+runs. If the update still fails:
 
 1. Retry the offered action once.
 2. Check that you updated the server's machine, not only the device you are using.

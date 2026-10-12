@@ -30,6 +30,12 @@ ready to commit.
 A failed or timed-out trial returns to the old version. After commit, the target
 is authoritative and the service manager's ordinary restart policy applies.
 
+The committed child, not the launcher, removes runtimes left by earlier updates:
+the launcher keeps running the version that installed the service, so code added
+to it reaches a host only after a local service update. Anything that starts or
+points at a runtime must stay visible to that prune, either as a running
+process's command line, the service definition, or a `t3` launcher symlink.
+
 ## Database rollback
 
 After the old child exits, the launcher snapshots SQLite's main file, WAL, and

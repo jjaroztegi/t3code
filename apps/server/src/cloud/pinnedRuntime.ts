@@ -378,3 +378,97 @@ const installPinnedRuntime = Effect.fn("cloud.pinned_runtime.ensure_installed")(
 
 export const ensurePinnedRuntimeInstalled = (input: PinnedRuntimeInstallInput) =>
   pinnedRuntimeInstallLock.withPermit(installPinnedRuntime(input));
+
+// A runtime published this recently may be about to start or be pointed at by
+// another installer (`t3 update`, an SSH launch) that has not done so yet.
+const PINNED_RUNTIME_PRUNE_MIN_AGE = Duration.hours(1);
+const PINNED_RUNTIME_PRUNE_PREFIX = ".prune-";
+// A reference file is a service definition or a launcher, never a large file.
+const PINNED_RUNTIME_REFERENCE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Removes completed runtimes nothing uses anymore and returns their versions.
+ * A runtime stays when it is in `keepVersions`, was published within the last
+ * hour, or its directory appears in a running process's command line (the
+ * service launcher, SSH-launched and foreground servers) or in one of
+ * `referenceFiles` (a service definition, or a `t3` launcher symlink). Without
+ * a process list nothing is removed. Only directories whose sentinel names
+ * them are candidates; staging and incomplete installs are left to the
+ * installer. Each removal renames the runtime away first, so a delete that
+ * fails partway never leaves something that looks installed, and the next
+ * prune retries it.
+ */
+export const prunePinnedRuntimes = Effect.fn("cloud.pinned_runtime.prune")(function* (input: {
+  readonly baseDir: string;
+  readonly keepVersions: ReadonlyArray<string>;
+  readonly referenceFiles: ReadonlyArray<string>;
+  readonly fs: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly runner: ProcessRunner.ProcessRunner["Service"];
+  readonly now: number;
+}) {
+  const { fs, path } = input;
+  const versionsDir = pinnedRuntimeVersionsDir(path, input.baseDir);
+  const processes = yield* input.runner.run({
+    command: "ps",
+    args: ["-A", "-ww", "-o", "args="],
+    timeout: Duration.seconds(10),
+  });
+  if (processes.code !== 0 || processes.stdoutTruncated) return [];
+  const references = [processes.stdout];
+  for (const file of input.referenceFiles) {
+    const target = yield* fs.readLink(file).pipe(Effect.option);
+    if (Option.isSome(target)) {
+      references.push(path.resolve(path.dirname(file), target.value));
+      continue;
+    }
+    const info = yield* fs.stat(file).pipe(Effect.option);
+    if (
+      Option.isSome(info) &&
+      info.value.type === "File" &&
+      Number(info.value.size) <= PINNED_RUNTIME_REFERENCE_MAX_BYTES
+    ) {
+      references.push(yield* fs.readFileString(file).pipe(Effect.orElseSucceed(() => "")));
+    }
+  }
+  // Match the `runtime/versions/<version>/` segment rather than the full
+  // directory: service definitions quote and escape the home directory.
+  const referenced = (version: string) => {
+    const segment = `${path.sep}${path.join(PINNED_RUNTIME_DIR, "versions", version)}${path.sep}`;
+    return references.some((reference) => reference.includes(segment));
+  };
+
+  const removed: string[] = [];
+  for (const name of yield* fs.readDirectory(versionsDir)) {
+    const versionDir = path.join(versionsDir, name);
+    if (name.startsWith(PINNED_RUNTIME_PRUNE_PREFIX)) {
+      yield* fs.remove(versionDir, { recursive: true, force: true }).pipe(Effect.ignore);
+      continue;
+    }
+    if (name.startsWith(".") || input.keepVersions.includes(name) || referenced(name)) continue;
+    if (Option.isSome(yield* fs.readLink(versionDir).pipe(Effect.option))) continue;
+    const sentinelPath = path.join(versionDir, ".install-complete");
+    const sentinel = yield* fs.readFileString(sentinelPath).pipe(Effect.option);
+    const published = yield* fs.stat(sentinelPath).pipe(
+      Effect.map((info) => info.mtime),
+      Effect.orElseSucceed(() => Option.none<Date>()),
+    );
+    if (
+      Option.isNone(sentinel) ||
+      sentinel.value.trim() !== name ||
+      Option.isNone(published) ||
+      input.now - published.value.getTime() < Duration.toMillis(PINNED_RUNTIME_PRUNE_MIN_AGE)
+    ) {
+      continue;
+    }
+    const doomed = path.join(versionsDir, `${PINNED_RUNTIME_PRUNE_PREFIX}${name}`);
+    const renamed = yield* fs.rename(versionDir, doomed).pipe(
+      Effect.as(true),
+      Effect.orElseSucceed(() => false),
+    );
+    if (!renamed) continue;
+    removed.push(name);
+    yield* fs.remove(doomed, { recursive: true, force: true }).pipe(Effect.ignore);
+  }
+  return removed;
+}, pinnedRuntimeInstallLock.withPermit);

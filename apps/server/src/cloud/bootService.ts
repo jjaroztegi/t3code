@@ -1,4 +1,6 @@
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -19,6 +21,7 @@ import {
   pinnedRuntimeCommand,
   pinnedRuntimePaths,
   PinnedRuntimeInstallError,
+  prunePinnedRuntimes,
 } from "./pinnedRuntime.ts";
 import {
   SERVICE_LAUNCHER_PROTOCOL,
@@ -1003,3 +1006,49 @@ export const layer = (input: {
   readonly cliVersion: string;
   readonly host?: BootServiceHost;
 }) => Layer.effect(BootService, make(input));
+
+/**
+ * Removes pinned runtimes nothing uses once the launcher has committed an
+ * update. Besides running processes, a runtime stays while this host's service
+ * definition or a `t3` launcher (the install script's bin dir or PATH) points
+ * at it. Failures are only logged: a committed update stays committed.
+ */
+export const pruneServiceRuntimes = Effect.fn("cloud.boot_service.prune_runtimes")(
+  function* (input: { readonly baseDir: string; readonly keepVersions: ReadonlyArray<string> }) {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const runner = yield* ProcessRunner.ProcessRunner;
+    const environment = yield* HostProcess.Environment;
+    const homeDir = environment["HOME"] ?? "";
+    const launcherDirs = [
+      environment["T3CODE_INSTALL_BIN_DIR"] ?? "",
+      homeDir === "" ? "" : path.join(homeDir, ".local", "bin"),
+      ...(environment["PATH"] ?? "").split(":"),
+    ].filter((directory) => directory.length > 0);
+    const serviceDefinitions =
+      homeDir === ""
+        ? []
+        : [
+            path.join(homeDir, ".config", "systemd", "user", BOOT_SERVICE_UNIT_FILE),
+            path.join(homeDir, "Library", "LaunchAgents", BOOT_SERVICE_PLIST_FILE),
+          ];
+    const removed = yield* prunePinnedRuntimes({
+      baseDir: input.baseDir,
+      keepVersions: input.keepVersions,
+      referenceFiles: [
+        ...serviceDefinitions,
+        ...launcherDirs.map((directory) => path.join(directory, "t3")),
+      ],
+      fs,
+      path,
+      runner,
+      now: yield* Clock.currentTimeMillis,
+    });
+    if (removed.length > 0) {
+      yield* Effect.logInfo("Removed unused t3 runtimes.", { versions: removed });
+    }
+  },
+  Effect.catchCause((cause) =>
+    Effect.logWarning("Could not remove unused t3 runtimes.", { cause: Cause.pretty(cause) }),
+  ),
+);

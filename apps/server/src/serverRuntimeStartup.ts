@@ -26,9 +26,11 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "./config.ts";
+import * as BootService from "./cloud/bootService.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import { flushCompileCache } from "./compileCache.ts";
 import * as Keybindings from "./keybindings.ts";
+import * as ProcessRunner from "./processRunner.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as EffectWorker from "./orchestration-v2/EffectWorker.ts";
 import * as LegacyV1ThreadImporter from "./orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
@@ -652,6 +654,14 @@ const make = (options?: StartupOptions) =>
       );
       yield* Effect.logDebug("startup phase: complete");
       yield* flushCompileCache;
+      // Every committed update leaves the previous runtime behind; keep it for
+      // rollback and remove the ones before it.
+      if (updateOutcome?.status === "committed") {
+        yield* BootService.pruneServiceRuntimes({
+          baseDir: serverConfig.baseDir,
+          keepVersions: [updateOutcome.targetVersion, updateOutcome.fromVersion],
+        }).pipe(Effect.provide(ProcessRunner.layer));
+      }
     }).pipe(
       Effect.annotateSpans({
         "server.mode": serverConfig.mode,

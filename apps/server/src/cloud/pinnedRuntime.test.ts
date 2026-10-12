@@ -15,6 +15,7 @@ import {
   pinnedRuntimePaths,
   PinnedRuntimeInstallError,
   type PinnedRuntimeProgress,
+  prunePinnedRuntimes,
 } from "./pinnedRuntime.ts";
 
 // Every install fetches the release archive, checks it against SHA256SUMS,
@@ -392,6 +393,123 @@ it.layer(NodeServices.layer)("ensurePinnedRuntimeInstalled", (it) => {
       yield* Fiber.interrupt(install);
       const versionsDir = path.join(baseDir, "runtime", "versions");
       assert.deepEqual(yield* fs.readDirectory(versionsDir), []);
+    }),
+  );
+});
+
+const psRunner = (stdout: string, code = 0) =>
+  ProcessRunner.ProcessRunner.of({
+    run: (input) =>
+      input.command === "ps"
+        ? Effect.succeed({
+            stdout,
+            stderr: "",
+            code: ChildProcessSpawner.ExitCode(code),
+            timedOut: false,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutInvalidUtf8: false,
+            stderrInvalidUtf8: false,
+          })
+        : Effect.die(`unexpected command ${input.command}`),
+  });
+
+it.layer(NodeServices.layer)("prunePinnedRuntimes", (it) => {
+  const installRuntimes = Effect.fn(function* (baseDir: string, versions: ReadonlyArray<string>) {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    for (const name of versions) {
+      const paths = pinnedRuntimePaths(path, baseDir, name, "linux");
+      yield* fs.makeDirectory(paths.versionDir, { recursive: true });
+      yield* fs.writeFileString(paths.entryPath, "#!/bin/sh\n");
+      yield* fs.writeFileString(paths.sentinelPath, `${name}\n`);
+      yield* fs.utimes(paths.sentinelPath, 0, 0);
+    }
+  });
+  const installed = Effect.fn(function* (baseDir: string) {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    return (yield* fs.readDirectory(path.join(baseDir, "runtime", "versions"))).toSorted();
+  });
+
+  it.effect("keeps active, rollback, and in-use runtimes and removes the rest", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pinned-prune-" });
+      const versionsDir = path.join(baseDir, "runtime", "versions");
+      yield* installRuntimes(baseDir, [
+        "0.0.40",
+        "0.0.41",
+        "0.0.42",
+        "0.0.43",
+        "0.0.44",
+        "0.0.45",
+        "0.0.46",
+        "0.0.47",
+      ]);
+      // Partial installs, staging, and a delete interrupted by an earlier prune.
+      yield* fs.makeDirectory(path.join(versionsDir, "0.0.39"));
+      yield* fs.makeDirectory(path.join(versionsDir, ".staging-abc"));
+      yield* fs.makeDirectory(path.join(versionsDir, ".prune-0.0.38"));
+      const now = 2 * 60 * 60 * 1000;
+      // Published moments ago, not yet started by whoever installed it.
+      const fresh = path.join(versionsDir, "0.0.44", ".install-complete");
+      yield* fs.utimes(fresh, now, now);
+      const unitPath = path.join(baseDir, "t3code.service");
+      yield* fs.writeFileString(
+        unitPath,
+        `ExecStart="${path.join(versionsDir, "0.0.42", "t3")}" __service-launcher\n`,
+      );
+
+      const removed = yield* prunePinnedRuntimes({
+        baseDir,
+        keepVersions: ["0.0.47", "0.0.46"],
+        referenceFiles: [unitPath, path.join(baseDir, "missing-launcher")],
+        fs,
+        path,
+        runner: psRunner(
+          [
+            "/sbin/init",
+            `${path.join(versionsDir, "0.0.41", "t3")} __service-launcher`,
+            `${path.join(versionsDir, "0.0.4", "t3")} serve`,
+          ].join("\n"),
+        ),
+        now,
+      });
+
+      assert.deepEqual(removed.toSorted(), ["0.0.40", "0.0.43", "0.0.45"]);
+      assert.deepEqual(yield* installed(baseDir), [
+        ".staging-abc",
+        "0.0.39",
+        "0.0.41",
+        "0.0.42",
+        "0.0.44",
+        "0.0.46",
+        "0.0.47",
+      ]);
+    }),
+  );
+
+  it.effect("removes nothing when running processes cannot be listed", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pinned-prune-" });
+      yield* installRuntimes(baseDir, ["0.0.40", "0.0.47"]);
+
+      const removed = yield* prunePinnedRuntimes({
+        baseDir,
+        keepVersions: ["0.0.47"],
+        referenceFiles: [],
+        fs,
+        path,
+        runner: psRunner("", 1),
+        now: 2 * 60 * 60 * 1000,
+      });
+
+      assert.deepEqual(removed, []);
+      assert.deepEqual(yield* installed(baseDir), ["0.0.40", "0.0.47"]);
     }),
   );
 });
